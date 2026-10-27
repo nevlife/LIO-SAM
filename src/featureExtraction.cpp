@@ -1,6 +1,8 @@
 #include "utility.hpp"
 #include "lio_sam/msg/cloud_info.hpp"
 
+#include <chrono>
+
 struct smoothness_t{ 
     float value;
     size_t ind;
@@ -22,6 +24,8 @@ public:
     rclcpp::Publisher<lio_sam::msg::CloudInfo>::SharedPtr pubLaserCloudInfo;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubCornerPoints;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubSurfacePoints;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pubCycleTime;
+    bool profileTimings = false;
 
     pcl::PointCloud<PointType>::Ptr extractedCloud;
     pcl::PointCloud<PointType>::Ptr cornerCloud;
@@ -50,6 +54,9 @@ public:
             "lio_sam/feature/cloud_corner", 1);
         pubSurfacePoints = create_publisher<sensor_msgs::msg::PointCloud2>(
             "lio_sam/feature/cloud_surface", 1);
+        profileTimings = declare_parameter<bool>("profile_timings", false);
+        pubCycleTime = create_publisher<std_msgs::msg::Float64MultiArray>(
+            "/scv/timing/lio_feature_extraction_ms", qos);
 
         initializationValue();
     }
@@ -71,6 +78,7 @@ public:
 
     void laserCloudInfoHandler(const lio_sam::msg::CloudInfo::SharedPtr msgIn)
     {
+        const auto cycleStart = std::chrono::steady_clock::now();
         cloudInfo = *msgIn; // new cloud info
         cloudHeader = msgIn->header; // new cloud header
         pcl::fromROSMsg(msgIn->cloud_deskewed, *extractedCloud); // new cloud for extraction
@@ -82,6 +90,16 @@ public:
         extractFeatures();
 
         publishFeatureCloud();
+
+        if (profileTimings)
+        {
+            std_msgs::msg::Float64MultiArray timing;
+            timing.data = {
+                stamp2Sec(cloudHeader.stamp),
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - cycleStart).count()};
+            pubCycleTime->publish(timing);
+        }
     }
 
     void calculateSmoothness()

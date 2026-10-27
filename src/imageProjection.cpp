@@ -1,6 +1,9 @@
 #include "utility.hpp"
 #include "lio_sam/msg/cloud_info.hpp"
 
+#include <algorithm>
+#include <chrono>
+
 struct VelodynePointXYZIRT
 {
     PCL_ADD_POINT4D
@@ -48,6 +51,8 @@ private:
 
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubExtractedCloud;
     rclcpp::Publisher<lio_sam::msg::CloudInfo>::SharedPtr pubLaserCloudInfo;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pubCycleTime;
+    bool profileTimings = false;
 
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr subImu;
     rclcpp::CallbackGroup::SharedPtr callbackGroupImu;
@@ -126,6 +131,9 @@ public:
             "lio_sam/deskew/cloud_deskewed", 1);
         pubLaserCloudInfo = create_publisher<lio_sam::msg::CloudInfo>(
             "lio_sam/deskew/cloud_info", qos);
+        profileTimings = declare_parameter<bool>("profile_timings", false);
+        pubCycleTime = create_publisher<std_msgs::msg::Float64MultiArray>(
+            "/scv/timing/lio_image_projection_ms", qos);
 
         allocateMemory();
         resetParameters();
@@ -207,6 +215,7 @@ public:
 
     void cloudHandler(const sensor_msgs::msg::PointCloud2::SharedPtr laserCloudMsg)
     {
+        const auto cycleStart = std::chrono::steady_clock::now();
         if (!cachePointCloud(laserCloudMsg))
             return;
 
@@ -220,6 +229,16 @@ public:
         publishClouds();
 
         resetParameters();
+
+        if (profileTimings)
+        {
+            std_msgs::msg::Float64MultiArray timing;
+            timing.data = {
+                stamp2Sec(cloudHeader.stamp),
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - cycleStart).count()};
+            pubCycleTime->publish(timing);
+        }
     }
 
     bool cachePointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr& laserCloudMsg)
@@ -260,14 +279,15 @@ public:
             rclcpp::shutdown();
         }
 
-        // get timestamp
-        cloudHeader = currentCloudMsg.header;
-        timeScanCur = stamp2Sec(cloudHeader.stamp);
-        timeScanEnd = timeScanCur + laserCloudIn->points.back().time;
-    
         // remove Nan
         vector<int> indices;
         pcl::removeNaNFromPointCloud(*laserCloudIn, *laserCloudIn, indices);
+
+        if (laserCloudIn->empty())
+        {
+            RCLCPP_WARN(get_logger(), "Received an empty point cloud, skipping scan.");
+            return false;
+        }
 
         // check dense flag
         if (laserCloudIn->is_dense == false)
@@ -314,6 +334,36 @@ public:
             }
             if (deskewFlag == -1)
                 RCLCPP_WARN(get_logger(), "Point cloud timestamp not available, deskew function disabled, system will drift significantly!");
+        }
+
+        cloudHeader = currentCloudMsg.header;
+        timeScanCur = stamp2Sec(cloudHeader.stamp);
+        timeScanEnd = timeScanCur;
+
+        if (deskewFlag == 1)
+        {
+            const auto timeBounds = std::minmax_element(
+                laserCloudIn->points.begin(), laserCloudIn->points.end(),
+                [](const auto& lhs, const auto& rhs) {
+                    return lhs.time < rhs.time;
+                });
+            const double minPointTime = timeBounds.first->time;
+            const double maxPointTime = timeBounds.second->time;
+
+            // Point times relative to the scan end are negative; rebase them on the scan start,
+            // shifting the header the other way so each point keeps its acquisition time.
+            const auto scanStart = rclcpp::Time(cloudHeader.stamp)
+                + rclcpp::Duration::from_seconds(minPointTime);
+            cloudHeader.stamp = scanStart;
+            timeScanCur = stamp2Sec(cloudHeader.stamp);
+            timeScanEnd = timeScanCur + (maxPointTime - minPointTime);
+            for (auto& point : laserCloudIn->points)
+                point.time -= minPointTime;
+
+            RCLCPP_INFO_ONCE(
+                get_logger(),
+                "Point time normalized: raw=[%.6f, %.6f] s, scan duration=%.6f s.",
+                minPointTime, maxPointTime, maxPointTime - minPointTime);
         }
 
         return true;
